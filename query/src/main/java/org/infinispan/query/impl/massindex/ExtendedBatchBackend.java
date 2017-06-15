@@ -1,20 +1,18 @@
 package org.infinispan.query.impl.massindex;
 
-import static java.util.Arrays.stream;
-
-import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 import org.hibernate.search.backend.FlushLuceneWork;
 import org.hibernate.search.backend.LuceneWork;
 import org.hibernate.search.backend.PurgeAllLuceneWork;
+import org.hibernate.search.backend.impl.StreamingOperationDispatcher;
 import org.hibernate.search.backend.impl.batch.DefaultBatchBackend;
 import org.hibernate.search.backend.spi.BatchBackend;
+import org.hibernate.search.backend.spi.OperationDispatcher;
 import org.hibernate.search.batchindexing.MassIndexerProgressMonitor;
 import org.hibernate.search.engine.integration.impl.ExtendedSearchIntegrator;
-import org.hibernate.search.engine.spi.EntityIndexBinding;
-import org.hibernate.search.indexes.spi.IndexManager;
 import org.hibernate.search.spi.IndexedTypeIdentifier;
-import org.hibernate.search.spi.IndexedTypesSet;
+import org.hibernate.search.spi.IndexedTypeSet;
 import org.hibernate.search.spi.SearchIntegrator;
 
 /**
@@ -26,19 +24,17 @@ import org.hibernate.search.spi.SearchIntegrator;
  */
 public class ExtendedBatchBackend implements BatchBackend {
    private final DefaultBatchBackend defaultBatchBackend;
-   private final SearchIntegrator integrator;
    private final MassIndexerProgressMonitor progressMonitor;
+   private final OperationDispatcher streamingDispatcher;
 
    public ExtendedBatchBackend(SearchIntegrator integrator, MassIndexerProgressMonitor progressMonitor) {
-      this.integrator = integrator;
       this.progressMonitor = progressMonitor;
       this.defaultBatchBackend = new DefaultBatchBackend(integrator.unwrap(ExtendedSearchIntegrator.class), progressMonitor);
+      this.streamingDispatcher = new StreamingOperationDispatcher( integrator, true /* forceAsync */ );
    }
 
-   public void purge(IndexedTypesSet entityTypes) {
-      performShardAwareOperation(entityTypes, (im, type) -> {
-         im.performStreamOperation(new PurgeAllLuceneWork(type), progressMonitor, false);
-      });
+   public void purge(IndexedTypeSet entityTypes) {
+      performTypeScopedOperations(entityTypes, type -> new PurgeAllLuceneWork(type));
       flush(entityTypes);
    }
 
@@ -58,24 +54,18 @@ public class ExtendedBatchBackend implements BatchBackend {
    }
 
    @Override
-   public void flush(IndexedTypesSet entityTypes) {
-      performShardAwareOperation(entityTypes, (im, type) -> {
-         im.performStreamOperation(new FlushLuceneWork(null, type), progressMonitor, false);
-      });
+   public void flush(IndexedTypeSet entityTypes) {
+      performTypeScopedOperations(entityTypes, type -> new FlushLuceneWork(null, type));
    }
 
    @Override
-   public void optimize(IndexedTypesSet entityTypes) {
+   public void optimize(IndexedTypeSet entityTypes) {
       defaultBatchBackend.optimize(entityTypes);
    }
 
-   private void performShardAwareOperation(IndexedTypesSet entityTypes, BiConsumer<IndexManager, IndexedTypeIdentifier> operation) {
+   private void performTypeScopedOperations(IndexedTypeSet entityTypes, Function<IndexedTypeIdentifier, LuceneWork> workFactory) {
       for (IndexedTypeIdentifier type : entityTypes) {
-         EntityIndexBinding indexBindingForEntity = integrator.getIndexBinding(type);
-         if (indexBindingForEntity != null) {
-            IndexManager[] indexManagers = indexBindingForEntity.getSelectionStrategy().getIndexManagersForDeletion(type.getPojoType(), null, null);
-            stream(indexManagers).forEach(im -> operation.accept(im, type));
-         }
+         streamingDispatcher.dispatch( workFactory.apply( type ), progressMonitor );
       }
    }
 }
